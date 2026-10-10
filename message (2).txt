@@ -1,0 +1,836 @@
+--[[====================================================================
+  [X2]Strongman Simulator — OP Trade (F-015)
+  tg: @sigmatik323
+  --------------------------------------------------------------------
+  Что делает:
+    • GUI-трейд-панель: выбираешь игрока и петов (OP-петы помечены),
+      жмёшь «ЗАПРОСИТЬ» → «ДОБАВИТЬ ВЫБРАННЫХ» → «ПОДТВЕРДИТЬ».
+    • Использует дыру F-015: серверный Trade_AddItem НЕ проверяет список
+      TradeBannedPets — OP-петов можно закинуть в сессию трейда прямым
+      вызовом ремоута, минуя скрытие в UI. Второй игрок принимает и
+      подтверждает обычным клиентом (у него пет появится в окне трейда).
+    • Добавление ДО принятия трейда вторым игроком тоже работает
+      (обход лимита вместимости, F-016).
+  --------------------------------------------------------------------
+  ВАЖНО (Potassium): вызовы игровых модулей (GetOwnedPets и т.п.) метят
+  поток — Instance-операции в нём после этого падают с "lacking capability
+  Plugin". Поэтому ВСЕ вызовы модулей идут только в отдельном воркер-
+  потоке (task.spawn), а GUI строит чистый поток. Не убирать!
+  --------------------------------------------------------------------
+  RightShift — скрыть/показать, X — unload.
+  Спам-лимит <= 400 запросов/сек, анти-АФК, конфиг между запусками.
+====================================================================]]
+
+if getgenv and getgenv().__SM_OPTRADE and getgenv().__SM_OPTRADE.Unload then
+	pcall(getgenv().__SM_OPTRADE.Unload)
+end
+pcall(function()
+	local p = (gethui and gethui()) or game:GetService("CoreGui")
+	local old = p:FindFirstChild("SMOPTradeGui")
+	if old then old:Destroy() end
+end)
+
+local __ok, __err = xpcall(function()
+
+local Players     = game:GetService("Players")
+local RS          = game:GetService("ReplicatedStorage")
+local HttpService = game:GetService("HttpService")
+local UIS         = game:GetService("UserInputService")
+local VirtualUser = game:GetService("VirtualUser")
+local plr         = Players.LocalPlayer
+
+local InstanceC = Instance
+local UDim2C    = UDim2
+local UDimC     = UDim
+local Color3C   = Color3
+local Vector2C  = Vector2
+local EnumC     = Enum
+
+local CONFIG_FILE  = "X2StrongmanOPTrade_settings.json"
+local TARGET_PLACE = 6766156863
+local RATE_LIMIT_PER_SEC = 400
+local ADD_GAP = 0.06
+
+local CLR = {
+	bg     = Color3C.fromRGB(16, 16, 20),
+	card   = Color3C.fromRGB(27, 27, 33),
+	card2  = Color3C.fromRGB(22, 22, 28),
+	stroke = Color3C.fromRGB(62, 62, 74),
+	text   = Color3C.fromRGB(235, 235, 235),
+	dim    = Color3C.fromRGB(150, 150, 160),
+	accent = Color3C.fromRGB(214, 58, 58),
+	busy   = Color3C.fromRGB(240, 186, 58),
+	ok     = Color3C.fromRGB(96, 200, 96),
+	bad    = Color3C.fromRGB(150, 36, 36),
+	op     = Color3C.fromRGB(255, 82, 82),
+}
+
+--====================================================================
+-- КОНФИГ
+--====================================================================
+local function loadConfig()
+	local raw
+	pcall(function() raw = readfile(CONFIG_FILE) end)
+	if not raw then return {} end
+	local ok, t = pcall(function() return HttpService:JSONDecode(raw) end)
+	if ok and type(t) == "table" then return t end
+	return {}
+end
+
+local cfg = loadConfig()
+cfg.x          = tonumber(cfg.x)
+cfg.y          = tonumber(cfg.y)
+cfg.visible    = cfg.visible ~= false
+cfg.autoAdd    = cfg.autoAdd == true
+cfg.autoConfirm = cfg.autoConfirm == true
+
+local function saveConfig()
+	pcall(function()
+		writefile(CONFIG_FILE, HttpService:JSONEncode({
+			x = cfg.x, y = cfg.y, visible = cfg.visible,
+			autoAdd = cfg.autoAdd, autoConfirm = cfg.autoConfirm,
+		}))
+	end)
+end
+
+--====================================================================
+-- ЛИМИТЕР
+--====================================================================
+local rateLast = 0
+local function rateLimit()
+	local minGap = 1 / RATE_LIMIT_PER_SEC
+	local d = os.clock() - rateLast
+	if d < minGap then task.wait(minGap - d) end
+	rateLast = os.clock()
+end
+
+--====================================================================
+-- ИГРОВЫЕ ДАННЫЕ (только через воркер-поток!)
+--====================================================================
+local TGSPetSystem = nil
+local BannedPets = {}
+local petsData = {}        -- [{id, name, rarity, op}]
+local petsLoaded = false
+
+-- воркер: тянет модули и данные, НИЧЕГО не создаёт через Instance
+local function fetchPetsAsync(onDone)
+	task.spawn(function()
+		pcall(function()
+			if not TGSPetSystem then
+				TGSPetSystem = require(workspace.Lib.PetSystem.TGSPetSystem)
+			end
+			if next(BannedPets) == nil then
+				local bp = require(workspace.Lib.Trading.TradeBannedPets)
+				if type(bp) == "table" then BannedPets = bp end
+			end
+			local owned = TGSPetSystem.GetOwnedPets(plr) or {}
+			local list = {}
+			for id, pet in pairs(owned) do
+				table.insert(list, {
+					id = id,
+					name = pet.Name,
+					rarity = pet.Rarity,
+					op = BannedPets[pet.Name] == true,
+				})
+			end
+			table.sort(list, function(a, b)
+				if a.op ~= b.op then return a.op end
+				if a.name ~= b.name then return a.name < b.name end
+				return tostring(a.id) < tostring(b.id)
+			end)
+			petsData = list
+			petsLoaded = true
+			if onDone then pcall(onDone) end
+		end)
+	end)
+end
+
+--====================================================================
+-- РЕМОУТЫ ТРЕЙДА
+--====================================================================
+local TradeRequest        = RS:FindFirstChild("Trade_Request")
+local TradeAccept         = RS:FindFirstChild("Trade_Accept")
+local TradeCancel         = RS:FindFirstChild("Trade_Cancel")
+local TradeCancelRequest  = RS:FindFirstChild("Trade_CancelRequest")
+local TradeAddItem        = RS:FindFirstChild("Trade_AddItem")
+local TradeConfirm        = RS:FindFirstChild("Trade_ConfirmTrade")
+local TradeSessionUpdated = RS:FindFirstChild("Trade_SessionUpdated")
+
+local session = nil
+local addedByUs = {}
+local confirmedFired = false
+local selectedPlayer = nil
+local selectedPets = {}
+local unloaded = false
+
+--====================================================================
+-- CONNECTIONS + АНТИ-АФК
+--====================================================================
+local conns = {}
+local function track(conn)
+	conns[#conns + 1] = conn
+	return conn
+end
+
+track(plr.Idled:Connect(function()
+	pcall(function()
+		VirtualUser:CaptureController()
+		VirtualUser:ClickButton2(Vector2C.new())
+	end)
+end))
+
+--====================================================================
+-- GUI
+--====================================================================
+local function guiParent()
+	local ok, hui = pcall(function() return gethui and gethui() end)
+	if ok and hui then return hui end
+	return game:GetService("CoreGui")
+end
+
+local ScreenGui = InstanceC.new("ScreenGui")
+ScreenGui.Name = "SMOPTradeGui"
+ScreenGui.ResetOnSpawn = false
+ScreenGui.ZIndexBehavior = EnumC.ZIndexBehavior.Sibling
+ScreenGui.DisplayOrder = 9998
+ScreenGui.IgnoreGuiInset = true
+ScreenGui.Parent = guiParent()
+
+local Window = InstanceC.new("Frame")
+Window.Name = "Window"
+Window.Size = UDim2C.fromOffset(430, 560)
+Window.BackgroundColor3 = CLR.bg
+Window.BorderSizePixel = 0
+Window.Active = true
+Window.Draggable = true
+Window.Visible = cfg.visible
+if cfg.x and cfg.y then
+	Window.Position = UDim2C.fromOffset(math.clamp(cfg.x, 0, 4000), math.clamp(cfg.y, 0, 2000))
+else
+	Window.Position = UDim2C.fromOffset(80, 90)
+end
+Window.Parent = ScreenGui
+
+local wStroke = InstanceC.new("UIStroke")
+wStroke.Color = CLR.stroke
+wStroke.Thickness = 1
+wStroke.Parent = Window
+local wCorner = InstanceC.new("UICorner")
+wCorner.CornerRadius = UDimC.new(0, 10)
+wCorner.Parent = Window
+
+local Header = InstanceC.new("Frame")
+Header.Name = "Header"
+Header.Size = UDim2C.new(1, 0, 0, 44)
+Header.BackgroundColor3 = CLR.card
+Header.BorderSizePixel = 0
+Header.Parent = Window
+local hCorner = InstanceC.new("UICorner")
+hCorner.CornerRadius = UDimC.new(0, 10)
+hCorner.Parent = Header
+
+local Title = InstanceC.new("TextLabel")
+Title.Name = "Title"
+Title.Size = UDim2C.new(1, -40, 0, 22)
+Title.Position = UDim2C.fromOffset(12, 3)
+Title.BackgroundTransparency = 1
+Title.Text = "OP Trade  ·  F-015"
+Title.TextColor3 = CLR.text
+Title.Font = EnumC.Font.GothamBold
+Title.TextSize = 15
+Title.TextXAlignment = EnumC.TextXAlignment.Left
+Title.Parent = Header
+
+local SubTitle = InstanceC.new("TextLabel")
+SubTitle.Name = "Sub"
+SubTitle.Size = UDim2C.new(1, -40, 0, 16)
+SubTitle.Position = UDim2C.fromOffset(12, 24)
+SubTitle.BackgroundTransparency = 1
+SubTitle.Text = "tg: @sigmatik323   ·   RS — скрыть, X — выгрузить"
+SubTitle.TextColor3 = CLR.dim
+SubTitle.Font = EnumC.Font.Gotham
+SubTitle.TextSize = 11
+SubTitle.TextXAlignment = EnumC.TextXAlignment.Left
+SubTitle.Parent = Header
+
+local CloseBtn = InstanceC.new("TextButton")
+CloseBtn.Name = "Close"
+CloseBtn.Size = UDim2C.fromOffset(26, 26)
+CloseBtn.Position = UDim2C.new(1, -32, 0, 6)
+CloseBtn.BackgroundColor3 = CLR.accent
+CloseBtn.BorderSizePixel = 0
+CloseBtn.Text = ""
+CloseBtn.Parent = Header
+local cCorner = InstanceC.new("UICorner")
+cCorner.CornerRadius = UDimC.new(0, 6)
+cCorner.Parent = CloseBtn
+
+local Status = InstanceC.new("TextLabel")
+Status.Name = "Status"
+Status.Size = UDim2C.new(1, -24, 0, 34)
+Status.Position = UDim2C.fromOffset(12, 50)
+Status.BackgroundColor3 = CLR.card2
+Status.BorderSizePixel = 0
+Status.Text = "сессия: нет"
+Status.TextColor3 = CLR.dim
+Status.Font = EnumC.Font.Gotham
+Status.TextSize = 12
+Status.TextWrapped = true
+Status.TextXAlignment = EnumC.TextXAlignment.Left
+Status.Parent = Window
+local sCorner = InstanceC.new("UICorner")
+sCorner.CornerRadius = UDimC.new(0, 6)
+sCorner.Parent = Status
+local sPad = InstanceC.new("UIPadding")
+sPad.PaddingLeft = UDimC.new(0, 8)
+sPad.PaddingRight = UDimC.new(0, 8)
+sPad.Parent = Status
+
+local function sectionLabel(text, y)
+	local lbl = InstanceC.new("TextLabel")
+	lbl.Size = UDim2C.new(1, -24, 0, 16)
+	lbl.Position = UDim2C.fromOffset(12, y)
+	lbl.BackgroundTransparency = 1
+	lbl.Text = text
+	lbl.TextColor3 = CLR.dim
+	lbl.Font = EnumC.Font.GothamBold
+	lbl.TextSize = 11
+	lbl.TextXAlignment = EnumC.TextXAlignment.Left
+	lbl.Parent = Window
+	return lbl
+end
+
+sectionLabel("ИГРОКИ", 92)
+
+local PlayersScroll = InstanceC.new("ScrollingFrame")
+PlayersScroll.Name = "PlayersScroll"
+PlayersScroll.Size = UDim2C.new(1, -24, 0, 86)
+PlayersScroll.Position = UDim2C.fromOffset(12, 110)
+PlayersScroll.BackgroundColor3 = CLR.card2
+PlayersScroll.BorderSizePixel = 0
+PlayersScroll.ScrollBarThickness = 4
+PlayersScroll.CanvasSize = UDim2C.new(0, 0, 0, 0)
+PlayersScroll.Parent = Window
+local psCorner = InstanceC.new("UICorner")
+psCorner.CornerRadius = UDimC.new(0, 6)
+psCorner.Parent = PlayersScroll
+local psList = InstanceC.new("UIListLayout")
+psList.Padding = UDimC.new(0, 3)
+psList.Parent = PlayersScroll
+local psPad = InstanceC.new("UIPadding")
+psPad.PaddingTop = UDimC.new(0, 4)
+psPad.PaddingLeft = UDimC.new(0, 4)
+psPad.Parent = PlayersScroll
+
+local function makeButton(text, x, y, w, h, color)
+	local b = InstanceC.new("TextButton")
+	b.Size = UDim2C.fromOffset(w, h)
+	b.Position = UDim2C.fromOffset(x, y)
+	b.BackgroundColor3 = color or CLR.card
+	b.BorderSizePixel = 0
+	b.Text = text
+	b.TextColor3 = CLR.text
+	b.Font = EnumC.Font.GothamBold
+	b.TextSize = 12
+	b.Parent = Window
+	local c = InstanceC.new("UICorner")
+	c.CornerRadius = UDimC.new(0, 6)
+	c.Parent = b
+	return b
+end
+
+local BtnRefreshPlayers = makeButton("обновить", 12, 202, 120, 26, CLR.card)
+local BtnRequest = makeButton("ЗАПРОСИТЬ ТРЕЙД", 138, 202, 150, 26, CLR.accent)
+local BtnAccept  = makeButton("ПРИНЯТЬ", 294, 202, 124, 26, CLR.card)
+local BtnCancel  = makeButton("отменить сессию", 138, 232, 150, 22, CLR.card)
+
+sectionLabel("МОИ ПЕТЫ (красные = OP, UI их скрывает)", 262)
+
+local PetsScroll = InstanceC.new("ScrollingFrame")
+PetsScroll.Name = "PetsScroll"
+PetsScroll.Size = UDim2C.new(1, -24, 0, 150)
+PetsScroll.Position = UDim2C.fromOffset(12, 280)
+PetsScroll.BackgroundColor3 = CLR.card2
+PetsScroll.BorderSizePixel = 0
+PetsScroll.ScrollBarThickness = 4
+PetsScroll.CanvasSize = UDim2C.new(0, 0, 0, 0)
+PetsScroll.Parent = Window
+local peCorner = InstanceC.new("UICorner")
+peCorner.CornerRadius = UDimC.new(0, 6)
+peCorner.Parent = PetsScroll
+local peList = InstanceC.new("UIListLayout")
+peList.Padding = UDimC.new(0, 3)
+peList.Parent = PetsScroll
+local pePad = InstanceC.new("UIPadding")
+pePad.PaddingTop = UDimC.new(0, 4)
+pePad.PaddingLeft = UDimC.new(0, 4)
+pePad.Parent = PetsScroll
+
+local BtnSelectOP  = makeButton("ВЫБРАТЬ ВСЕХ OP", 12, 438, 130, 26, CLR.card)
+local BtnClearSel  = makeButton("снять выбор", 148, 438, 110, 26, CLR.card)
+local BtnRefreshPets = makeButton("обновить петов", 264, 438, 154, 26, CLR.card)
+
+local BtnAdd    = makeButton("ДОБАВИТЬ ВЫБРАННЫХ В ТРЕЙД", 12, 470, 200, 34, CLR.accent)
+local BtnConfirm = makeButton("ПОДТВЕРДИТЬ", 218, 470, 200, 34, CLR.accent)
+
+local function makeToggle(text, x, y, get, set)
+	local btn = makeButton("", x, y, 200, 22, CLR.card)
+	btn.TextXAlignment = EnumC.TextXAlignment.Left
+	local pad = InstanceC.new("UIPadding")
+	pad.PaddingLeft = UDimC.new(0, 8)
+	pad.Parent = btn
+	local function render()
+		btn.Text = (get() and "[x] " or "[ ] ") .. text
+		btn.TextColor3 = get() and CLR.ok or CLR.dim
+	end
+	btn.MouseButton1Click:Connect(function()
+		set(not get())
+		render()
+		saveConfig()
+	end)
+	render()
+	return btn
+end
+
+makeToggle("авто-добавление (после Accepted)", 12, 510, function() return cfg.autoAdd end, function(v) cfg.autoAdd = v end)
+makeToggle("авто-подтверждение", 218, 510, function() return cfg.autoConfirm end, function(v) cfg.autoConfirm = v end)
+
+local Footer = InstanceC.new("TextLabel")
+Footer.Size = UDim2C.new(1, -24, 0, 14)
+Footer.Position = UDim2C.fromOffset(12, 536)
+Footer.BackgroundTransparency = 1
+Footer.Text = "OP-петов UI не показывает — кладём ремоутом напрямую. Партнёр принимает и подтверждает сам."
+Footer.TextColor3 = CLR.dim
+Footer.Font = EnumC.Font.Gotham
+Footer.TextSize = 10
+Footer.TextXAlignment = EnumC.TextXAlignment.Left
+Footer.TextWrapped = false
+Footer.Parent = Window
+
+--====================================================================
+-- ЛОГИКА ТРЕЙДА
+--====================================================================
+local function mySide()
+	if not session then return nil end
+	if session.RequesterUser == plr then return "Requester" end
+	if session.ReceiverUser == plr then return "Receiver" end
+	return nil
+end
+
+local function otherPlayer()
+	if not session then return nil end
+	if session.RequesterUser == plr then return session.ReceiverUser end
+	if session.ReceiverUser == plr then return session.RequesterUser end
+	return nil
+end
+
+local function ourItems()
+	if not session then return {} end
+	local side = mySide()
+	if side == "Requester" then return session.RequesterItems or {} end
+	if side == "Receiver" then return session.ReceiverItems or {} end
+	return {}
+end
+
+local function ourFlag()
+	if not session then return false end
+	if mySide() == "Requester" then return session.RequesterConfirmed == true end
+	if mySide() == "Receiver" then return session.ReceiverConfirmed == true end
+	return false
+end
+
+local function otherFlag()
+	if not session then return false end
+	if mySide() == "Requester" then return session.ReceiverConfirmed == true end
+	if mySide() == "Receiver" then return session.RequesterConfirmed == true end
+	return false
+end
+
+local function shortId(id)
+	return tostring(id):sub(1, 8)
+end
+
+local function updateStatus()
+	if not Status or not Status.Parent then return end
+	if not session then
+		Status.Text = "сессия: нет. Выбери игрока → ЗАПРОСИТЬ ТРЕЙД."
+		Status.TextColor3 = CLR.dim
+		return
+	end
+	local other = otherPlayer()
+	local items = ourItems()
+	local added = 0
+	for _, _ in pairs(items) do added = added + 1 end
+	local sel = 0
+	for _, on in pairs(selectedPets) do if on then sel = sel + 1 end end
+	local flags = ""
+	if ourFlag() then flags = " [мы: ПОДТВ." end
+	if otherFlag() then
+		if flags == "" then flags = " [партнёр: ПОДТВ." else flags = flags .. " · партнёр: ПОДТВ." end
+	end
+	if flags ~= "" then flags = flags .. "]" end
+	Status.Text = ("сессия %s | %s | %s | в трейде=%d | выбрано=%d%s"):format(
+		shortId(session.Id or "?"),
+		tostring(session.Status or "?"),
+		mySide() == "Requester" and "мы=requester" or (mySide() == "Receiver" and "мы=receiver" or "мы=? bit"),
+		added,
+		sel,
+		flags
+	)
+	Status.TextColor3 = (session.Status == "Confirmed") and CLR.ok
+		or (session.Status == "Accepted") and CLR.busy
+		or (session.Status == "Cancelled") and CLR.bad
+		or CLR.text
+	if other then
+		Status.Text = Status.Text .. "  ·  партнёр: " .. other.DisplayName
+	end
+end
+
+local playersRows = {}
+local function refreshPlayers()
+	for _, c in ipairs(playersRows) do pcall(function() c:Destroy() end) end
+	playersRows = {}
+	for _, p in ipairs(Players:GetPlayers()) do
+		if p ~= plr then
+			local row = InstanceC.new("TextButton")
+			row.Size = UDim2C.new(1, -8, 0, 24)
+			row.BackgroundColor3 = (selectedPlayer == p) and CLR.stroke or CLR.card
+			row.BorderSizePixel = 0
+			row.Text = p.DisplayName .. "  (@" .. p.Name .. ")"
+			row.TextColor3 = (selectedPlayer == p) and CLR.text or CLR.dim
+			row.Font = EnumC.Font.Gotham
+			row.TextSize = 12
+			row.TextXAlignment = EnumC.TextXAlignment.Left
+			row.Parent = PlayersScroll
+			local pad = InstanceC.new("UIPadding")
+			pad.PaddingLeft = UDimC.new(0, 6)
+			pad.Parent = row
+			local c = InstanceC.new("UICorner")
+			c.CornerRadius = UDimC.new(0, 5)
+			c.Parent = row
+			row.MouseButton1Click:Connect(function()
+				selectedPlayer = p
+				refreshPlayers()
+			end)
+			table.insert(playersRows, row)
+		end
+	end
+	PlayersScroll.CanvasSize = UDim2C.new(0, 0, 0, #playersRows * 27 + 8)
+end
+
+local petRows = {}
+local function renderPets()
+	for _, c in ipairs(petRows) do pcall(function() c:Destroy() end) end
+	petRows = {}
+	for _, item in ipairs(petsData) do
+		local row = InstanceC.new("TextButton")
+		row.Size = UDim2C.new(1, -8, 0, 24)
+		row.BackgroundColor3 = item.op and Color3C.fromRGB(48, 20, 20) or CLR.card
+		row.BorderSizePixel = 0
+		row.Text = (selectedPets[item.id] and "[x] " or "[ ] ")
+			.. (item.op and "OP · " or "")
+			.. item.name .. " (" .. tostring(item.rarity) .. ")"
+		row.TextColor3 = item.op and CLR.op or CLR.text
+		row.Font = item.op and EnumC.Font.GothamBold or EnumC.Font.Gotham
+		row.TextSize = 12
+		row.TextXAlignment = EnumC.TextXAlignment.Left
+		row.Parent = PetsScroll
+		local pad = InstanceC.new("UIPadding")
+		pad.PaddingLeft = UDimC.new(0, 6)
+		pad.Parent = row
+		local c = InstanceC.new("UICorner")
+		c.CornerRadius = UDimC.new(0, 5)
+		c.Parent = row
+		row.MouseButton1Click:Connect(function()
+			selectedPets[item.id] = not selectedPets[item.id] or nil
+			renderPets()
+			updateStatus()
+		end)
+		table.insert(petRows, row)
+	end
+	PetsScroll.CanvasSize = UDim2C.new(0, 0, 0, #petRows * 27 + 8)
+end
+
+-- главный поток: строим строки ТОЛЬКО из готового снапшота petsData
+local function refreshPets()
+	if not petsLoaded then
+		fetchPetsAsync(function() end)
+		local t0 = os.clock()
+		while not petsLoaded and os.clock() - t0 < 5 do task.wait(0.1) end
+	end
+	if petsLoaded then
+		renderPets()
+	end
+end
+
+local function flash(btn, color)
+	if not btn or not btn.Parent then return end
+	local old = btn.BackgroundColor3
+	btn.BackgroundColor3 = color or CLR.ok
+	task.delay(1.2, function()
+		if btn and btn.Parent and not unloaded then
+			btn.BackgroundColor3 = old
+		end
+	end)
+end
+
+local function requestTrade()
+	if not TradeRequest then return end
+	if not selectedPlayer or not selectedPlayer.Parent then
+		flash(BtnRequest, CLR.bad)
+		return
+	end
+	task.spawn(function()
+		local ok = pcall(function() return TradeRequest:InvokeServer(selectedPlayer) end)
+		flash(BtnRequest, ok and CLR.ok or CLR.bad)
+		if not ok then
+			pcall(print, "[OPTrade] Trade_Request упал (возможно, сессия уже есть)")
+		end
+	end)
+end
+
+local function acceptIncoming()
+	if not TradeAccept then return end
+	if not session or session.Status ~= "Sent" then
+		flash(BtnAccept, CLR.bad)
+		return
+	end
+	if session.RequesterUser == plr then
+		flash(BtnAccept, CLR.bad)
+		return
+	end
+	task.spawn(function()
+		local ok = pcall(function() return TradeAccept:InvokeServer(session.RequesterUser) end)
+		flash(BtnAccept, ok and CLR.ok or CLR.bad)
+	end)
+end
+
+local function cancelSession()
+	if not TradeCancel or not session then
+		flash(BtnCancel, CLR.bad)
+		return
+	end
+	if session.RequesterUser == plr and session.Status == "Sent" and TradeCancelRequest then
+		task.spawn(function()
+			pcall(function() return TradeCancelRequest:InvokeServer(session.ReceiverUser) end)
+		end)
+		return
+	end
+	task.spawn(function()
+		local ok = pcall(function() return TradeCancel:InvokeServer({ Id = session.Id }) end)
+		flash(BtnCancel, ok and CLR.ok or CLR.bad)
+	end)
+end
+
+local function alreadyInTrade(petId)
+	if not session then return false end
+	local function scan(list)
+		for _, v in pairs(list or {}) do
+			if v.Id == petId then return true end
+		end
+		return false
+	end
+	return scan(session.RequesterItems) or scan(session.ReceiverItems)
+end
+
+local function addSelected(manual)
+	if not TradeAddItem or not session then
+		if manual then flash(BtnAdd, CLR.bad) end
+		return 0
+	end
+	if session.Status == "Confirmed" or session.Status == "Cancelled" then
+		if manual then flash(BtnAdd, CLR.bad) end
+		return 0
+	end
+	local toAdd = {}
+	for petId, on in pairs(selectedPets) do
+		if on and not alreadyInTrade(petId) and not addedByUs[petId] then
+			table.insert(toAdd, petId)
+		end
+	end
+	if #toAdd == 0 then
+		if manual then flash(BtnAdd, CLR.ok) end
+		return 0
+	end
+	local count = 0
+	for _, petId in ipairs(toAdd) do
+		rateLimit()
+		local ok = pcall(function()
+			return TradeAddItem:InvokeServer({ Id = session.Id }, { Id = petId, Category = "Pets" })
+		end)
+		if ok then
+			count = count + 1
+			addedByUs[petId] = true
+		end
+		if ADD_GAP > 0 then task.wait(ADD_GAP) end
+	end
+	if manual then flash(BtnAdd, count > 0 and CLR.ok or CLR.bad) end
+	pcall(print, ("[OPTrade] добавлено петов: %d"):format(count))
+	updateStatus()
+	return count
+end
+
+local function confirmTrade()
+	if not TradeConfirm or not session then
+		flash(BtnConfirm, CLR.bad)
+		return
+	end
+	if session.Status == "Confirmed" or session.Status == "Cancelled" then
+		flash(BtnConfirm, CLR.bad)
+		return
+	end
+	local sid = session.Id
+	task.spawn(function()
+		local ok = pcall(function() return TradeConfirm:InvokeServer({ Id = sid }) end)
+		if ok then
+			confirmedFired = true
+			flash(BtnConfirm, CLR.ok)
+		else
+			flash(BtnConfirm, CLR.bad)
+		end
+	end)
+end
+
+-- авто-режим
+local lastSessionId = nil
+task.spawn(function()
+	while not unloaded do
+		task.wait(0.5)
+		if session and session.Id ~= lastSessionId then
+			lastSessionId = session.Id
+			addedByUs = {}
+			confirmedFired = false
+			updateStatus()
+		end
+		if session and cfg.autoAdd and session.Status == "Accepted" then
+			local any = false
+			for _, on in pairs(selectedPets) do
+				if on then any = true break end
+			end
+			if any then
+				local n = addSelected(false)
+				if n > 0 then updateStatus() end
+			end
+		end
+		if session and cfg.autoConfirm and session.Status == "Accepted" and not confirmedFired and not ourFlag() then
+			local anyAdded = false
+			for _, _ in pairs(ourItems()) do anyAdded = true break end
+			local anySelected = false
+			for _, on in pairs(selectedPets) do
+				if on then anySelected = true break end
+			end
+			if anyAdded or not anySelected then
+				confirmTrade()
+			end
+		end
+	end
+end)
+
+--====================================================================
+-- СОБЫТИЯ
+--====================================================================
+if TradeSessionUpdated then
+	track(TradeSessionUpdated.OnClientEvent:Connect(function(sess)
+		if type(sess) == "table" and sess.Id then
+			session = sess
+			updateStatus()
+		end
+	end))
+end
+
+track(Players.PlayerAdded:Connect(function() task.defer(refreshPlayers) end))
+track(Players.PlayerRemoving:Connect(function(p)
+	if selectedPlayer == p then selectedPlayer = nil end
+	task.defer(refreshPlayers)
+end))
+
+BtnRefreshPlayers.MouseButton1Click:Connect(function() pcall(refreshPlayers) end)
+BtnRequest.MouseButton1Click:Connect(function() pcall(requestTrade) end)
+BtnAccept.MouseButton1Click:Connect(function() pcall(acceptIncoming) end)
+BtnCancel.MouseButton1Click:Connect(function() pcall(cancelSession) end)
+BtnAdd.MouseButton1Click:Connect(function() pcall(function() addSelected(true) end) end)
+BtnConfirm.MouseButton1Click:Connect(function() pcall(confirmTrade) end)
+BtnRefreshPets.MouseButton1Click:Connect(function() pcall(refreshPets) end)
+BtnClearSel.MouseButton1Click:Connect(function()
+	selectedPets = {}
+	pcall(renderPets)
+	updateStatus()
+end)
+BtnSelectOP.MouseButton1Click:Connect(function()
+	for _, item in ipairs(petsData) do
+		if item.op then selectedPets[item.id] = true end
+	end
+	pcall(renderPets)
+	updateStatus()
+end)
+CloseBtn.MouseButton1Click:Connect(function()
+	if getgenv and getgenv().__SM_OPTRADE then getgenv().__SM_OPTRADE.Unload() end
+end)
+
+track(UIS.InputBegan:Connect(function(input, processed)
+	if processed then return end
+	pcall(function()
+		if input.KeyCode == EnumC.KeyCode.RightShift then
+			Window.Visible = not Window.Visible
+			cfg.visible = Window.Visible
+			saveConfig()
+		elseif input.KeyCode == EnumC.KeyCode.X then
+			if getgenv and getgenv().__SM_OPTRADE then getgenv().__SM_OPTRADE.Unload() end
+		end
+	end)
+end))
+
+--====================================================================
+-- UNLOAD
+--====================================================================
+local function unload()
+	if unloaded then return end
+	unloaded = true
+	pcall(function()
+		cfg.x = math.floor(Window.AbsolutePosition.X)
+		cfg.y = math.floor(Window.AbsolutePosition.Y)
+	end)
+	saveConfig()
+	for i = 1, #conns do pcall(function() conns[i]:Disconnect() end) end
+	pcall(function() ScreenGui:Destroy() end)
+	if getgenv then getgenv().__SM_OPTRADE = nil end
+end
+
+if getgenv then
+	getgenv().__SM_OPTRADE = {
+		Unload = unload,
+		requestTrade = requestTrade,
+		acceptIncoming = acceptIncoming,
+		addSelected = addSelected,
+		confirmTrade = confirmTrade,
+		cancelSession = cancelSession,
+		refreshPets = refreshPets,
+		getSession = function() return session end,
+	}
+end
+
+--====================================================================
+-- СТАРТ
+--====================================================================
+if game.PlaceId ~= TARGET_PLACE then
+	pcall(print, ("[OPTrade] не тот плейс: %d (скрипт для %d)"):format(game.PlaceId, TARGET_PLACE))
+else
+	refreshPlayers()
+	refreshPets()
+	updateStatus()
+	pcall(print, "[OPTrade] GUI готов. Выбери игрока → ЗАПРОСИТЬ ТРЕЙД → выбери OP-петов → ДОБАВИТЬ → ПОДТВЕРДИТЬ.")
+end
+
+end, function(e)
+	local tb = ""
+	pcall(function() tb = debug.traceback(tostring(e), 2) end)
+	if getgenv then
+		pcall(function() getgenv().__SM_OPTRADE_error = tostring(e) end)
+		pcall(function() getgenv().__SM_OPTRADE_tb = tb end)
+	end
+	pcall(print, "[OPTrade] ОШИБКА: " .. tostring(e) .. "\n" .. tb)
+end)
+
+if not __ok then
+	warn("[OPTrade] скрипт упал: " .. tostring(__err))
+end
