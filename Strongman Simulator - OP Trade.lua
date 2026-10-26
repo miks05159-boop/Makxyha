@@ -124,11 +124,12 @@ local FALLBACK_BANNED = {
 	OpReindeer = true, OpTurkey = true,
 }
 
-local BannedPets   = {}
-local petsData     = {}
-local petsVersion  = 0
-local petsStatus   = "загрузка..."
-local fetching     = false
+local BannedPets    = {}
+local petsData      = {}
+local petsVersion   = 0
+local petsStatus    = "загрузка..."
+local statusVersion = 0
+local fetching      = false
 
 local function getJobId()
 	local id = game.JobId
@@ -163,55 +164,90 @@ local function buildPets(pets, lockedIds)
 	return list
 end
 
+local fetchToken = 0
+local fetchAttempts = 0
+
+local function setPetsStatus(text)
+	petsStatus = text
+	statusVersion = statusVersion + 1
+end
+
 local function fetchPets()
 	if fetching then return end
 	fetching = true
-	petsStatus = "загрузка..."
+	fetchToken = fetchToken + 1
+	local token = fetchToken
+	setPetsStatus("загрузка...")
+
+	task.delay(15, function()
+		if token == fetchToken and fetching then
+			fetching = false
+			setPetsStatus("таймаут данных — жми ОБНОВИТЬ")
+		end
+	end)
+
 	task.spawn(function()
-		if next(BannedPets) == nil then
-			pcall(function()
-				local bp = require(workspace.Lib.Trading.TradeBannedPets)
-				if type(bp) == "table" then BannedPets = bp end
-			end)
-			if next(BannedPets) == nil then BannedPets = FALLBACK_BANNED end
-		end
-
-		local pets, lockedIds, errText
-
-		-- путь 1: полный снапшот данных игрока через хешированный RemoteFunction
-		local ok1 = pcall(function()
-			local TGSMisc = require(workspace.Lib.TGSMisc)
-			local remName = TGSMisc.MD5("TGSDataStore_requestPlayerDataServerFunc" .. getJobId())
-			local rf = RS:WaitForChild(remName, 20)
-			if not rf then error("data remote not found") end
-			local data = rf:InvokeServer()
-			if type(data) ~= "table" then error("bad player data") end
-			pets = data.Pets
-			lockedIds = data.LockedPets
-		end)
-		if not ok1 or type(pets) ~= "table" then
-			-- путь 2: клиентский модуль PetSystem (работает не во всех экзекьюторах)
-			local ok2, e2 = pcall(function()
-				local P = require(workspace.Lib.PetSystem.TGSPetSystem)
-				pets = P.GetOwnedPets(plr)
-				lockedIds = P.GetLockedPets(plr)
-			end)
-			if not ok2 then errText = tostring(e2) end
-		end
-
-		if type(pets) == "table" then
-			petsData = buildPets(pets, lockedIds)
-			local opCount = 0
-			for _, it in ipairs(petsData) do
-				if it.op then opCount = opCount + 1 end
+		local ok, err = pcall(function()
+			if next(BannedPets) == nil then
+				pcall(function()
+					local bp = require(workspace.Lib.Trading.TradeBannedPets)
+					if type(bp) == "table" then BannedPets = bp end
+				end)
+				if next(BannedPets) == nil then BannedPets = FALLBACK_BANNED end
 			end
-			petsStatus = ("петов: %d · OP: %d"):format(#petsData, opCount)
-			petsVersion = petsVersion + 1
-		else
-			petsStatus = "ошибка данных петов"
-			pcall(print, "[OPTrade] не смог получить петов: " .. tostring(errText))
+
+			local pets, lockedIds, errText
+
+			-- путь 1: полный снапшот данных игрока через хешированный RemoteFunction
+			local ok1 = pcall(function()
+				local TGSMisc = require(workspace.Lib.TGSMisc)
+				local remName = TGSMisc.MD5("TGSDataStore_requestPlayerDataServerFunc" .. getJobId())
+				local rf = RS:WaitForChild(remName, 10)
+				if not rf then error("data remote not found") end
+				local data = rf:InvokeServer()
+				if type(data) ~= "table" then error("bad player data") end
+				pets = data.Pets
+				lockedIds = data.LockedPets
+			end)
+			if not ok1 or type(pets) ~= "table" then
+				-- путь 2: клиентский модуль PetSystem (работает не во всех экзекьюторах)
+				local ok2, e2 = pcall(function()
+					local P = require(workspace.Lib.PetSystem.TGSPetSystem)
+					pets = P.GetOwnedPets(plr)
+					lockedIds = P.GetLockedPets(plr)
+				end)
+				if not ok2 then errText = tostring(e2) end
+			end
+
+			if token ~= fetchToken then return end
+
+			if type(pets) == "table" then
+				petsData = buildPets(pets, lockedIds)
+				local opCount = 0
+				for _, it in ipairs(petsData) do
+					if it.op then opCount = opCount + 1 end
+				end
+				setPetsStatus(("петов: %d · OP: %d"):format(#petsData, opCount))
+				petsVersion = petsVersion + 1
+				if #petsData == 0 and fetchAttempts < 6 then
+					fetchAttempts = fetchAttempts + 1
+					setPetsStatus(("петов: 0 · ждём данные (%d/6)"):format(fetchAttempts))
+					task.delay(2, function()
+						if token == fetchToken then fetchPets() end
+					end)
+				else
+					fetchAttempts = 0
+				end
+			else
+				setPetsStatus("ошибка данных петов")
+				pcall(print, "[OPTrade] не смог получить петов: " .. tostring(errText))
+			end
+		end)
+		if not ok then
+			if token == fetchToken then setPetsStatus("ошибка: " .. tostring(err)) end
+			pcall(print, "[OPTrade] fetch упал: " .. tostring(err))
 		end
-		fetching = false
+		if token == fetchToken then fetching = false end
 	end)
 end
 
@@ -584,7 +620,7 @@ local function updateStatus()
 	if not Status or not Status.Parent then return end
 	local head
 	if not session then
-		head = "сессия: нет. Выбери игрока → ЗАПРОСИТЬ ТРЕЙД."
+		head = "нет сессии · 1) ПРИНЯТЬ запрос  2) ВСЁ OP  3) ДОБАВИТЬ  4) ПОДТВЕРДИТЬ"
 		Status.TextColor3 = CLR.dim
 	else
 		local other = otherPlayer()
@@ -682,7 +718,7 @@ local function renderPets()
 		end))
 		table.insert(petRows, row)
 	end
-	PetsTitle.Text = "МОИ ПЕТЫ (" .. #petsData .. ", красные = OP)"
+	PetsTitle.Text = ("МОИ ПЕТЫ · %s (%d, красные = OP)"):format(plr.Name, #petsData)
 end
 
 --====================================================================
@@ -874,25 +910,21 @@ task.spawn(function()
 			end
 		end
 		if session and cfg.autoConfirm and session.Status == "Accepted"
-			and not ourFlag() then
-			local anySelected = false
-			for _, on in pairs(selectedPets) do
-				if on then anySelected = true break end
-			end
-			if ourItemCount() > 0 or not anySelected then
-				confirmTrade()
-			end
+			and not ourFlag() and ourItemCount() > 0 then
+			confirmTrade()
 		end
 	end
 end)
 
 -- рендер-цикл (чистый поток, до создания GUI ничего не require-илось)
 local renderedVersion = -1
+local renderedStatusVersion = -1
 task.spawn(function()
 	while not unloaded do
 		task.wait(0.2)
-		if petsVersion ~= renderedVersion then
+		if petsVersion ~= renderedVersion or statusVersion ~= renderedStatusVersion then
 			renderedVersion = petsVersion
+			renderedStatusVersion = statusVersion
 			pcall(renderPets)
 			pcall(updateStatus)
 		end
@@ -920,6 +952,11 @@ if TradeSessionUpdated then
 end
 
 track(Players.PlayerAdded:Connect(function() task.defer(refreshPlayers) end))
+track(plr.CharacterAdded:Connect(function()
+	task.delay(1.5, function()
+		if not unloaded then fetchPets() end
+	end)
+end))
 track(Players.PlayerRemoving:Connect(function(p)
 	if selectedPlayer == p then selectedPlayer = nil end
 	task.defer(refreshPlayers)
