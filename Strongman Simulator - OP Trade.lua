@@ -229,10 +229,10 @@ local function fetchPets()
 				end
 				setPetsStatus(("петов: %d · OP: %d"):format(#petsData, opCount))
 				petsVersion = petsVersion + 1
-				if #petsData == 0 and fetchAttempts < 6 then
+				if #petsData == 0 and fetchAttempts < 25 then
 					fetchAttempts = fetchAttempts + 1
-					setPetsStatus(("петов: 0 · ждём данные (%d/6)"):format(fetchAttempts))
-					task.delay(2, function()
+					setPetsStatus(("ждём данные игрока (%d/25)"):format(fetchAttempts))
+					task.delay(0.6, function()
 						if token == fetchToken then fetchPets() end
 					end)
 				else
@@ -363,11 +363,17 @@ end
 
 local VIEW_W = 430
 local VIEW_H = 596
+local uiScale = 1
+
+local function isTouchDevice()
+	return UIS.TouchEnabled and not UIS.KeyboardEnabled
+end
 
 local function clampPos(x, y)
 	local vp = workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize or Vector2C.new(1280, 720)
-	return math.clamp(x, -VIEW_W + 80, math.max(0, vp.X - 80)),
-		math.clamp(y, 0, math.max(0, vp.Y - 40))
+	local w, h = VIEW_W * uiScale, VIEW_H * uiScale
+	return math.clamp(x, -w + 80, math.max(0, vp.X - w)),
+		math.clamp(y, 0, math.max(0, vp.Y - h))
 end
 
 local ScreenGui = InstanceC.new("ScreenGui")
@@ -385,13 +391,40 @@ Window.BackgroundColor3 = CLR.bg
 Window.BorderSizePixel = 0
 Window.Active = true
 Window.Visible = cfg.visible
+Window.Parent = ScreenGui
+
+local uiScaleObj = InstanceC.new("UIScale")
+uiScaleObj.Scale = 1
+uiScaleObj.Parent = Window
+
+local function updateScale()
+	local vp = (workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize) or Vector2C.new(1280, 720)
+	if isTouchDevice() then
+		uiScale = math.clamp(math.min((vp.X * 0.94) / VIEW_W, (vp.Y * 0.92) / VIEW_H), 0.55, 1.7)
+	else
+		uiScale = 1
+	end
+	uiScaleObj.Scale = uiScale
+	local x, y = clampPos(Window.AbsolutePosition.X, Window.AbsolutePosition.Y)
+	Window.Position = UDim2C.fromOffset(x, y)
+end
+
 do
 	local vp = (workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize) or Vector2C.new(1280, 720)
 	local x = math.clamp(cfg.x or 80, 0, math.max(0, vp.X - VIEW_W))
 	local y = math.clamp(cfg.y or 60, 0, math.max(0, vp.Y - VIEW_H))
 	Window.Position = UDim2C.fromOffset(x, y)
 end
-Window.Parent = ScreenGui
+
+updateScale()
+do
+	local cam = workspace.CurrentCamera
+	if cam then
+		track(cam:GetPropertyChangedSignal("ViewportSize"):Connect(function()
+			if not unloaded then updateScale() end
+		end))
+	end
+end
 
 local wStroke = InstanceC.new("UIStroke")
 wStroke.Color = CLR.stroke
@@ -597,7 +630,7 @@ do
 		if input.UserInputType ~= EnumC.UserInputType.MouseMovement
 			and input.UserInputType ~= EnumC.UserInputType.Touch then return end
 		local delta = input.Position - dragStart
-		local x, y = clampPos(startPos.X.Offset + delta.X, startPos.Y.Offset + delta.Y)
+		local x, y = clampPos(startPos.X.Offset + delta.X / uiScale, startPos.Y.Offset + delta.Y / uiScale)
 		Window.Position = UDim2C.fromOffset(x, y)
 	end))
 end
